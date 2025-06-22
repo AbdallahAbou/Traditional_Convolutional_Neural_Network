@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: clinicalpass
+      MYSQL_DATABASE: clinical_rag
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8100:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+volumes:
+  mysql_data:
+  chroma_data:
