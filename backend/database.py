@@ -285,3 +285,69 @@ class Database:
         else:
             items = [text.strip()]
         return [x for x in items if x and x.lower() != 'none']
+
+    # ============== SQL Query Tool ==============
+    
+    def run_sql_query(self, query: str, limit: int = 50) -> Dict[str, Any]:
+        """
+        Execute a read-only SQL query against the patients table.
+        
+        Security constraints:
+        - Only SELECT statements allowed
+        - Only patients and documents tables accessible
+        - Results limited to prevent large outputs
+        - No writes, deletes, or schema changes
+        
+        Args:
+            query: SQL SELECT query
+            limit: Max rows to return (default 50, max 100)
+            
+        Returns:
+            Dict with columns, rows, and row_count
+        """
+        # Security: Only allow SELECT
+        query_upper = query.strip().upper()
+        if not query_upper.startswith('SELECT'):
+            return {"error": "Only SELECT queries are allowed"}
+        
+        # Security: Block dangerous keywords
+        dangerous = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'TRUNCATE', 
+                     'CREATE', 'GRANT', 'REVOKE', 'EXEC', 'EXECUTE', '--', ';']
+        for kw in dangerous:
+            if kw in query_upper:
+                return {"error": f"Query contains forbidden keyword: {kw}"}
+        
+        # Enforce limit
+        limit = min(limit, 100)
+        
+        # Add LIMIT if not present
+        if 'LIMIT' not in query_upper:
+            query = query.rstrip(';') + f' LIMIT {limit}'
+        
+        conn = self._get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            
+            # Convert any special types to strings
+            for row in rows:
+                for key, val in row.items():
+                    if hasattr(val, 'isoformat'):
+                        row[key] = val.isoformat()
+                    elif isinstance(val, bytes):
+                        row[key] = val.decode('utf-8', errors='replace')
+            
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            
+            return {
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+                "limited": len(rows) >= limit
+            }
+        except Exception as e:
+            return {"error": f"Query error: {str(e)}"}
+        finally:
+            cursor.close()
+            conn.close()

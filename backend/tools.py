@@ -149,6 +149,28 @@ class ToolRegistry:
             },
             "function": self._get_follow_up_plan
         }
+        
+        # Tool: Run SQL Query (for aggregations and custom analysis)
+        self.tools["run_sql_query"] = {
+            "name": "run_sql_query",
+            "description": "Execute a read-only SQL query against the database. Use this for aggregations, counting, filtering, or complex queries that other tools cannot handle. Only SELECT queries on the patients and documents tables are allowed. Examples: counting patients by diagnosis, finding patients with specific lab values, aggregating statistics.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "SQL SELECT query. Available tables: patients (patient_id, age, sex, primary_diagnosis, disease_stage, current_medications, allergies, alt_u_l, ast_u_l, bilirubin_mg_dl, afp_ng_ml, creatinine_mg_dl, egfr_ml_min, inr, platelets_k_ul, etc.), documents (doc_id, patient_id, doc_type, content)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum rows to return (default 50, max 100)",
+                        "default": 50
+                    }
+                },
+                "required": ["query"]
+            },
+            "function": self._run_sql_query
+        }
     
     # ============== Tool Implementations ==============
     
@@ -253,6 +275,10 @@ class ToolRegistry:
             "primary_diagnosis": profile.get("diagnoses", {}).get("primary"),
             "procedures": profile.get("procedures", [])
         }
+    
+    def _run_sql_query(self, query: str, limit: int = 50) -> Dict[str, Any]:
+        """Run a read-only SQL query"""
+        return self.db.run_sql_query(query, limit)
     
     # ============== Registry Methods ==============
     

@@ -34,6 +34,14 @@ AVAILABLE TOOLS:
 5. retrieve_note_chunks - Semantic search over clinical notes
 6. get_safety_info - Allergies and contraindications
 7. get_follow_up_plan - Follow-up appointments and care plan
+8. run_sql_query - Execute SQL queries for aggregations, counts, filtering (read-only SELECT only)
+
+WHEN TO USE SQL QUERIES:
+- Counting patients by criteria (e.g., "how many patients have diabetes")
+- Aggregating statistics (e.g., "average age of patients with cirrhosis")
+- Finding patients matching specific criteria
+- Complex filtering that other tools cannot handle
+- Global queries across all patients
 
 RESPONSE PROTOCOL:
 1. Analyze the query to determine required data sources
