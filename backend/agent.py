@@ -1,6 +1,6 @@
 """
 EHR Agent - LLM planner with tool-use capabilities
-Uses OpenAI GPT-4o for reasoning and tool orchestration
+Uses OpenAI GPT-4o with function calling for dynamic tool orchestration
 """
 
 import os
@@ -31,21 +31,28 @@ AVAILABLE TOOLS:
 2. get_medications - Current medications with dosages
 3. get_latest_labs - Most recent laboratory values
 4. get_recent_imaging - Imaging studies and findings
-5. retrieve_note_chunks - Semantic search over clinical notes
+5. retrieve_note_chunks - Semantic search over clinical notes (RAG)
 6. get_safety_info - Allergies and contraindications
 7. get_follow_up_plan - Follow-up appointments and care plan
 8. run_sql_query - Execute SQL queries for aggregations, counts, filtering (read-only SELECT only)
 
-WHEN TO USE SQL QUERIES:
+WHEN TO USE SQL QUERIES (run_sql_query):
 - Counting patients by criteria (e.g., "how many patients have diabetes")
 - Aggregating statistics (e.g., "average age of patients with cirrhosis")
 - Finding patients matching specific criteria
 - Complex filtering that other tools cannot handle
 - Global queries across all patients
+- Use table: patients (columns: patient_id, age, sex, primary_diagnosis, disease_stage, current_medications, allergies, etc.)
+- Use table: documents (columns: doc_id, patient_id, doc_type, content)
+
+WHEN TO USE RAG (retrieve_note_chunks):
+- Searching for specific information in clinical notes
+- Finding mentions of symptoms, procedures, or treatments
+- Looking up qualitative information from narratives
 
 RESPONSE PROTOCOL:
 1. Analyze the query to determine required data sources
-2. Use tools to gather relevant information
+2. Use tools to gather relevant information (call multiple tools if needed)
 3. Synthesize findings with explicit citations
 4. State confidence level and evidence gaps
 5. Include safety notes when applicable
@@ -53,7 +60,7 @@ RESPONSE PROTOCOL:
 CITATION FORMAT:
 - Reference sources as [doc_type:doc_id] e.g., [discharge:P-1001_discharge]
 - State when data comes from structured fields vs. clinical notes
-- Acknowledge if retrieved evidence is incomplete
+- For SQL results, cite as [SQL query result]
 
 PROHIBITED ACTIONS:
 - Making diagnostic conclusions
@@ -64,7 +71,7 @@ PROHIBITED ACTIONS:
 
 
 class EHRAgent:
-    """LLM Agent with tool-use for EHR queries"""
+    """LLM Agent with dynamic tool calling for EHR queries"""
     
     def __init__(self, tool_registry: ToolRegistry):
         self.tool_registry = tool_registry
@@ -74,6 +81,7 @@ class EHRAgent:
             raise ValueError("OPENAI_API_KEY environment variable is required")
         
         self.model = "gpt-4o"
+        self.max_tool_iterations = 5  # Prevent infinite loops
         logger.info(f"Initialized EHR Agent with {self.model}")
     
     async def run(
@@ -86,180 +94,235 @@ class EHRAgent:
         session_id: str = ""
     ) -> Dict[str, Any]:
         """
-        Execute agent query with tool orchestration.
+        Execute agent query with dynamic tool orchestration.
         
-        Args:
-            patient_id: Patient identifier (None for global queries)
-            query: User query
-            history: Conversation history
-            top_k: Number of chunks to retrieve
-            use_reranker: Whether to apply cross-encoder reranking
-            session_id: Audit session identifier
-        
-        Returns:
-            answer: Generated response
-            chunks: Retrieved evidence
-            tool_calls: Tool execution trace
-            metrics: Latency and token counts
+        The LLM decides which tools to call via OpenAI function calling.
+        Supports multiple tool calls in a single response.
         """
         history = history or []
-        tool_calls = []
+        tool_calls_trace = []
         all_chunks = []
         metrics = {
             "retrieval_latency_ms": 0,
             "llm_latency_ms": 0,
-            "rerank_latency_ms": 0,
             "tokens_in": 0,
-            "tokens_out": 0
+            "tokens_out": 0,
+            "tool_iterations": 0
         }
         
         is_global = patient_id is None
         
-        # Stage 1: Retrieve relevant chunks
-        retrieval_start = time.time()
-        retrieval_result = self.tool_registry.call_tool(
-            "retrieve_note_chunks",
-            {
-                "patient_id": patient_id,  # None for global search
-                "query": query, 
-                "k": top_k,
-                "use_reranker": use_reranker
-            }
-        )
-        metrics["retrieval_latency_ms"] = int((time.time() - retrieval_start) * 1000)
+        # Build context message
+        context_msg = self._build_context_message(patient_id, query)
         
-        if "result" in retrieval_result:
-            all_chunks = retrieval_result["result"].get("chunks", [])
-            tool_calls.append({
-                "tool_name": "retrieve_note_chunks",
-                "parameters": {"patient_id": patient_id, "query": query, "k": top_k},
-                "result_summary": f"Retrieved {len(all_chunks)} chunks" + (" (global)" if is_global else ""),
-                "latency_ms": retrieval_result.get("latency_ms", 0)
-            })
+        # Prepare messages for OpenAI
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": context_msg}
+        ]
         
-        # Stage 2: Get structured patient profile (only for patient-specific queries)
-        patient_context = ""
-        if patient_id:
-            profile_result = self.tool_registry.call_tool(
-                "get_patient_profile",
-                {"patient_id": patient_id}
-            )
-            if "result" in profile_result and "error" not in profile_result["result"]:
-                profile = profile_result["result"]
-                patient_context = self._format_profile_context(profile)
-                tool_calls.append({
-                    "tool_name": "get_patient_profile",
-                    "parameters": {"patient_id": patient_id},
-                    "result_summary": f"Retrieved profile for {patient_id}",
-                    "latency_ms": profile_result.get("latency_ms", 0)
-                })
-        else:
-            patient_context = "GLOBAL QUERY MODE: Searching across all 100 patients in the database."
+        # Get tools in OpenAI format
+        tools = self.tool_registry.get_openai_tools()
         
-        # Stage 3: Format context for LLM
-        chunks_context = self._format_chunks_context(all_chunks)
-        
-        # Stage 4: Generate response
+        # Agentic loop - let LLM call tools until it has enough info
         llm_start = time.time()
-        answer, tokens = await self._call_llm(
-            query, patient_context, chunks_context, history
-        )
+        total_tokens_in = 0
+        total_tokens_out = 0
+        assistant_message = {"content": ""}
+        
+        for iteration in range(self.max_tool_iterations):
+            metrics["tool_iterations"] = iteration + 1
+            
+            # Call LLM
+            response, tokens = await self._call_llm_with_tools(messages, tools)
+            total_tokens_in += tokens.get("input", 0)
+            total_tokens_out += tokens.get("output", 0)
+            
+            if "error" in response:
+                return {
+                    "answer": f"Error: {response['error']}",
+                    "chunks": [],
+                    "tool_calls": tool_calls_trace,
+                    "metrics": metrics
+                }
+            
+            assistant_message = response["message"]
+            messages.append(assistant_message)
+            
+            # Check if LLM wants to call tools
+            if not assistant_message.get("tool_calls"):
+                # LLM is done, extract final answer
+                break
+            
+            # Process each tool call
+            for tool_call in assistant_message["tool_calls"]:
+                tool_name = tool_call["function"]["name"]
+                tool_args = json.loads(tool_call["function"]["arguments"])
+                
+                # Inject defaults for retrieve_note_chunks
+                if tool_name == "retrieve_note_chunks":
+                    if "k" not in tool_args:
+                        tool_args["k"] = top_k
+                    if "use_reranker" not in tool_args:
+                        tool_args["use_reranker"] = use_reranker
+                    # If patient_id not specified, use context patient_id (or None for global)
+                    if "patient_id" not in tool_args:
+                        tool_args["patient_id"] = patient_id
+                
+                # Execute tool
+                tool_start = time.time()
+                result = self.tool_registry.call_tool(tool_name, tool_args)
+                tool_latency = int((time.time() - tool_start) * 1000)
+                
+                # Track metrics
+                if tool_name == "retrieve_note_chunks":
+                    metrics["retrieval_latency_ms"] += tool_latency
+                    if "result" in result:
+                        chunks = result["result"].get("chunks", [])
+                        all_chunks.extend(chunks)
+                
+                # Build result summary
+                result_summary = self._summarize_tool_result(tool_name, result)
+                
+                tool_calls_trace.append({
+                    "tool_name": tool_name,
+                    "parameters": tool_args,
+                    "result_summary": result_summary,
+                    "latency_ms": tool_latency
+                })
+                
+                # Add tool result to messages
+                tool_result_content = json.dumps(result.get("result", result), default=str)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": tool_result_content[:8000]  # Limit context size
+                })
+        
         metrics["llm_latency_ms"] = int((time.time() - llm_start) * 1000)
-        metrics["tokens_in"] = tokens.get("input", 0)
-        metrics["tokens_out"] = tokens.get("output", 0)
+        metrics["tokens_in"] = total_tokens_in
+        metrics["tokens_out"] = total_tokens_out
+        
+        # Extract final answer
+        final_answer = assistant_message.get("content", "")
+        if not final_answer:
+            final_answer = "I was unable to generate a response. Please try rephrasing your question."
+        
+        # Deduplicate chunks
+        seen_ids = set()
+        unique_chunks = []
+        for chunk in all_chunks:
+            chunk_id = chunk.get("doc_id", "") + chunk.get("text", "")[:50]
+            if chunk_id not in seen_ids:
+                seen_ids.add(chunk_id)
+                unique_chunks.append(chunk)
         
         return {
-            "answer": answer,
-            "chunks": all_chunks,
-            "tool_calls": tool_calls,
+            "answer": final_answer,
+            "chunks": unique_chunks[:top_k],  # Limit returned chunks
+            "tool_calls": tool_calls_trace,
             "metrics": metrics
         }
     
-    def _format_profile_context(self, profile: Dict[str, Any]) -> str:
-        """Format patient profile for LLM context"""
-        demo = profile.get("demographics", {})
-        diag = profile.get("diagnoses", {})
-        vitals = profile.get("vitals", {})
-        labs = profile.get("labs", {})
-        
-        lines = [
-            f"PATIENT PROFILE: {profile.get('patient_id')}",
-            f"Demographics: {demo.get('age')}yo {demo.get('sex')}, BMI {demo.get('bmi')}",
-            f"Primary Diagnosis: {diag.get('primary')} (Stage: {diag.get('stage', 'N/A')})",
-            f"Secondary Conditions: {', '.join(diag.get('secondary', [])) or 'None'}",
-            f"Vitals: BP {vitals.get('bp_systolic')}/{vitals.get('bp_diastolic')}, HR {vitals.get('heart_rate')}, Temp {vitals.get('temperature_c')}C",
-            f"Key Labs: ALT {labs.get('alt_u_l')}, AST {labs.get('ast_u_l')}, Bili {labs.get('bilirubin_mg_dl')}, Cr {labs.get('creatinine_mg_dl')}, INR {labs.get('inr')}, Plt {labs.get('platelets_k_ul')}",
-            f"Medications: {', '.join(profile.get('medications', [])) or 'None'}",
-            f"Allergies: {', '.join(profile.get('allergies', [])) or 'None'}",
-            f"Contraindications: {', '.join(profile.get('contraindications', [])) or 'None'}",
-            f"Recent Imaging: {profile.get('imaging', {}).get('type')} - {profile.get('imaging', {}).get('findings')}"
-        ]
-        return "\n".join(lines)
-    
-    def _format_chunks_context(self, chunks: List[Dict[str, Any]]) -> str:
-        """Format retrieved chunks for LLM context with citations"""
-        if not chunks:
-            return "No relevant clinical notes found."
-        
-        lines = ["RETRIEVED CLINICAL NOTES:"]
-        for i, chunk in enumerate(chunks, 1):
-            source = f"[{chunk.get('doc_type', 'note')}:{chunk.get('doc_id', 'unknown')}]"
-            section = f"Section: {chunk.get('section')}" if chunk.get('section') else ""
-            score = chunk.get('relevance_score', chunk.get('score', 0))
-            lines.append(f"\n--- Chunk {i} {source} (relevance: {score:.3f}) {section}")
-            lines.append(chunk.get('text', ''))
-        
-        return "\n".join(lines)
-    
-    async def _call_llm(
-        self, 
-        query: str, 
-        patient_context: str, 
-        chunks_context: str, 
-        history: List
-    ) -> tuple[str, Dict[str, int]]:
-        """Call OpenAI GPT-4o API"""
-        
-        user_message = f"""Based on the following patient information and clinical notes, please answer this question:
+    def _build_context_message(self, patient_id: Optional[str], query: str) -> str:
+        """Build the initial context message for the LLM"""
+        if patient_id:
+            return f"""You are answering a question about patient {patient_id}.
 
 QUESTION: {query}
 
-{patient_context}
+Use the available tools to gather the information needed to answer this question. 
+Start by retrieving relevant data using the appropriate tools."""
+        else:
+            return f"""You are answering a GLOBAL question across ALL patients in the database (100 synthetic patients).
 
-{chunks_context}
+QUESTION: {query}
 
-Provide a thorough answer citing the relevant sources. Use [doc_type:doc_id] format for citations."""
+Use the available tools to gather the information needed to answer this question.
+For counting or aggregation queries, use run_sql_query with appropriate SQL.
+For searching clinical notes, use retrieve_note_chunks without patient_id for global search."""
+    
+    def _summarize_tool_result(self, tool_name: str, result: Dict) -> str:
+        """Create a brief summary of tool result for UI display"""
+        if "error" in result:
+            return f"Error: {result['error']}"
+        
+        r = result.get("result", {})
+        
+        if tool_name == "retrieve_note_chunks":
+            count = r.get("count", 0)
+            scope = r.get("patient_id", "GLOBAL")
+            return f"Retrieved {count} chunks ({scope})"
+        
+        elif tool_name == "run_sql_query":
+            if "error" in r:
+                return f"SQL Error: {r['error']}"
+            row_count = r.get("row_count", 0)
+            return f"SQL returned {row_count} rows"
+        
+        elif tool_name == "get_patient_profile":
+            pid = r.get("patient_id", "unknown")
+            diag = r.get("diagnoses", {}).get("primary", "")[:30]
+            return f"Profile: {pid} - {diag}"
+        
+        elif tool_name in ["get_medications", "get_safety_info"]:
+            meds = len(r.get("current_medications", []))
+            allergies = len(r.get("allergies", []))
+            return f"{meds} medications, {allergies} allergies"
+        
+        elif tool_name == "get_latest_labs":
+            return f"Labs for {r.get('patient_id', 'unknown')}"
+        
+        elif tool_name == "get_recent_imaging":
+            imaging = r.get("imaging", {})
+            return f"Imaging: {imaging.get('type', 'none')}"
+        
+        elif tool_name == "get_follow_up_plan":
+            return f"Follow-up: {r.get('follow_up_date', 'N/A')}"
+        
+        return "Completed"
+    
+    async def _call_llm_with_tools(
+        self, 
+        messages: List[Dict], 
+        tools: List[Dict]
+    ) -> tuple[Dict, Dict[str, int]]:
+        """Call OpenAI API with function calling enabled"""
         
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_message}
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 2048
+            try:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "tools": tools,
+                        "tool_choice": "auto",
+                        "temperature": 0.3,
+                        "max_tokens": 2048
+                    }
+                )
+                
+                if response.status_code != 200:
+                    error_msg = f"OpenAI API error: {response.status_code} - {response.text}"
+                    logger.error(error_msg)
+                    return {"error": error_msg}, {"input": 0, "output": 0}
+                
+                data = response.json()
+                
+                message = data["choices"][0]["message"]
+                usage = data.get("usage", {})
+                tokens = {
+                    "input": usage.get("prompt_tokens", 0),
+                    "output": usage.get("completion_tokens", 0)
                 }
-            )
-            
-            if response.status_code != 200:
-                error_msg = f"OpenAI API error: {response.status_code}"
-                logger.error(f"{error_msg} - {response.text}")
-                return error_msg, {"input": 0, "output": 0}
-            
-            data = response.json()
-            
-            answer = data["choices"][0]["message"]["content"]
-            usage = data.get("usage", {})
-            tokens = {
-                "input": usage.get("prompt_tokens", 0),
-                "output": usage.get("completion_tokens", 0)
-            }
-            
-            return answer, tokens
+                
+                return {"message": message}, tokens
+                
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                return {"error": str(e)}, {"input": 0, "output": 0}
